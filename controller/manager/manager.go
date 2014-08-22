@@ -1,7 +1,8 @@
-package main
+package manager
 
 import (
 	"crypto/tls"
+	"errors"
 	"strings"
 	"time"
 
@@ -9,7 +10,24 @@ import (
 	"github.com/citadel/citadel/cluster"
 	"github.com/citadel/citadel/scheduler"
 	r "github.com/dancannon/gorethink"
+	"github.com/gorilla/sessions"
 	"github.com/shipyard/shipyard"
+	"github.com/sirupsen/logrus"
+)
+
+const (
+	tblNameConfig   = "config"
+	tblNameEvents   = "events"
+	tblNameAccounts = "accounts"
+	storeKey        = "shipyard"
+)
+
+var (
+	ErrAccountExists       = errors.New("account already exists")
+	ErrAccountDoesNotExist = errors.New("account does not exist")
+	ErrInvalidAuthToken    = errors.New("invalid auth token")
+	logger                 = logrus.New()
+	store                  = sessions.NewCookieStore([]byte(storeKey))
 )
 
 type (
@@ -19,12 +37,10 @@ type (
 		session        *r.Session
 		clusterManager *cluster.Cluster
 		engines        []*shipyard.Engine
+		authenticator  *shipyard.Authenticator
+		store          *sessions.CookieStore
+		StoreKey       string
 	}
-)
-
-const (
-	tblNameConfig = "config"
-	tblNameEvents = "events"
 )
 
 func NewManager(addr string, database string) (*Manager, error) {
@@ -38,18 +54,29 @@ func NewManager(addr string, database string) (*Manager, error) {
 		return nil, err
 	}
 	m := &Manager{
-		address:  addr,
-		database: database,
-		session:  session,
+		address:       addr,
+		database:      database,
+		session:       session,
+		authenticator: &shipyard.Authenticator{},
+		store:         store,
+		StoreKey:      storeKey,
 	}
 	m.initdb()
 	m.init()
 	return m, nil
 }
 
+func (m *Manager) ClusterManager() *cluster.Cluster {
+	return m.clusterManager
+}
+
+func (m *Manager) Store() *sessions.CookieStore {
+	return m.store
+}
+
 func (m *Manager) initdb() {
 	// create tables if needed
-	tables := []string{tblNameConfig, tblNameEvents}
+	tables := []string{tblNameConfig, tblNameEvents, tblNameAccounts}
 	for _, tbl := range tables {
 		_, err := r.Table(tbl).Run(m.session)
 		if err != nil {
@@ -182,4 +209,109 @@ func (m *Manager) Events(limit int) ([]*shipyard.Event, error) {
 		return nil, err
 	}
 	return events, nil
+}
+
+func (m *Manager) Accounts() ([]*shipyard.Account, error) {
+	res, err := r.Table(tblNameAccounts).OrderBy(r.Asc("username")).Run(m.session)
+	if err != nil {
+		return nil, err
+	}
+	var accounts []*shipyard.Account
+	if err := res.All(&accounts); err != nil {
+		return nil, err
+	}
+	return accounts, nil
+}
+
+func (m *Manager) Account(username string) (*shipyard.Account, error) {
+	res, err := r.Table(tblNameAccounts).Filter(map[string]string{"username": username}).Run(m.session)
+	if err != nil {
+		return nil, err
+
+	}
+	if res.IsNil() {
+		return nil, ErrAccountDoesNotExist
+	}
+	var account *shipyard.Account
+	if err := res.One(&account); err != nil {
+		return nil, err
+	}
+	return account, nil
+}
+
+func (m *Manager) SaveAccount(account *shipyard.Account) error {
+	pass := account.Password
+	hash, err := m.authenticator.Hash(pass)
+	if err != nil {
+		return err
+	}
+	// check if exists; if so, update
+	acct, err := m.Account(account.Username)
+	if err != nil && err != ErrAccountDoesNotExist {
+		return err
+	}
+	account.Password = hash
+	if acct != nil {
+		if _, err := r.Table(tblNameAccounts).Update(account).RunWrite(m.session); err != nil {
+			return err
+		}
+		return nil
+	}
+	if _, err := r.Table(tblNameAccounts).Insert(account).RunWrite(m.session); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) DeleteAccount(account *shipyard.Account) error {
+	res, err := r.Table(tblNameAccounts).Filter(map[string]string{"id": account.ID}).Delete().Run(m.session)
+	if err != nil {
+		return err
+	}
+	if res.IsNil() {
+		return ErrAccountDoesNotExist
+	}
+	return nil
+}
+
+func (m *Manager) Authenticate(username, password string) bool {
+	acct, err := m.Account(username)
+	if err != nil {
+		return false
+	}
+	return m.authenticator.Authenticate(password, acct.Password)
+}
+
+func (m *Manager) NewAuthToken(username string) (*shipyard.AuthToken, error) {
+	token, err := m.authenticator.GenerateToken()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := r.Table(tblNameAccounts).Filter(map[string]string{"username": username}).Update(map[string]string{"token": token}).Run(m.session); err != nil {
+		return nil, err
+	}
+	tk := &shipyard.AuthToken{Token: token}
+	return tk, nil
+}
+
+func (m *Manager) VerifyAuthToken(username, token string) error {
+	acct, err := m.Account(username)
+	if err != nil {
+		return err
+	}
+	if token != acct.Token {
+		return ErrInvalidAuthToken
+	}
+	return nil
+}
+
+func (m *Manager) ChangePassword(username, password string) error {
+	hash, err := m.authenticator.Hash(password)
+	if err != nil {
+		return err
+	}
+	if _, err := r.Table(tblNameAccounts).Filter(map[string]string{"username": username}).Update(map[string]string{"password": hash}).Run(m.session); err != nil {
+		return err
+	}
+	return nil
 }
